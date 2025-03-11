@@ -1,0 +1,8 @@
+streamlit
+numpy
+opencv-python
+Pillow
+scipy
+pandas
+pta-learn
+tsfresh
