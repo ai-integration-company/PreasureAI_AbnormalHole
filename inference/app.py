@@ -1,305 +1,260 @@
-import base64
-import os
-import numpy as np
-import torch
-from torch import nn
-from torchvision import models, transforms
-import cv2
-from scipy.interpolate import interp1d
-from PIL import Image
 import streamlit as st
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import pickle
+import os
 
-# ----------------------- Model & Helper Functions -----------------------
+from scipy.optimize import minimize_scalar
+from pta_learn.tpmr import TPMR
+from tsfresh import extract_features
+from tsfresh.feature_extraction import MinimalFCParameters
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 
-# Define feature names
-bin_columns = [
-    "Некачественное ГДИС",
-    "Влияние ствола скважины",
-    "Радиальный режим",
-    "Линейный режим",
-    "Билинейный режим",
-    "Сферический режим",
-    "Граница постоянного давления",
-    "Граница непроницаемый разлом",
-]
-num_columns = [
-    "Влияние ствола скважины_details",
-    "Радиальный режим_details",
-    "Линейный режим_details",
-    "Билинейный режим_details",
-    "Сферический режим_details",
-    "Граница постоянного давления_details",
-    "Граница непроницаемый разлом_details",
-]
+def load_series(series_path):
+    df = pd.read_csv(series_path, delimiter='\t', header=None, names=['Time', 'Pressure'])
+    return df
 
-# Define model architecture
-class MultiTaskResNet(nn.Module):
-    def __init__(self, pretrained=False):
-        super().__init__()
-        self.base = models.resnet101(pretrained=pretrained)
-        # Modify first conv layer for 6 channels
-        orig_conv = self.base.conv1
-        new_conv = nn.Conv2d(
-            in_channels=6,
-            out_channels=orig_conv.out_channels,
-            kernel_size=orig_conv.kernel_size,
-            stride=orig_conv.stride,
-            padding=orig_conv.padding,
-            bias=orig_conv.bias,
-        )
-        with torch.no_grad():
-            new_conv.weight[:, :3, :, :] = orig_conv.weight[:, :3, :, :]
-            new_conv.weight[:, 3:, :, :] = orig_conv.weight[:, :3, :, :]
-        self.base.conv1 = new_conv
+def split_series_by_gap(df, gap):
+    segments = []
+    start_idx = 0
+    ts = df['Time'].values
+    for i in range(1, len(ts)):
+        if (ts[i] - ts[i-1]) > gap:
+            segments.append(df.iloc[start_idx:i].copy())
+            start_idx = i
+    if start_idx < len(ts):
+        segments.append(df.iloc[start_idx:].copy())
+    return segments
 
-        num_feats = self.base.fc.in_features
-        self.base.fc = nn.Identity()
-
-        self.binary = nn.Sequential(
-            nn.Linear(num_feats, 512),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.1),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.1),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-            nn.Linear(64, 8),
-        )
-
-        self.resgresion = nn.Sequential(
-            nn.Linear(num_feats + 24, 512),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(0.1),
-            nn.Linear(512, 256),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(0.1),
-            nn.Linear(256, 128),
-            nn.BatchNorm1d(128),
-            nn.LeakyReLU(0.1),
-            nn.Linear(128, 64),
-            nn.BatchNorm1d(64),
-            nn.LeakyReLU(0.1),
-            nn.Linear(64, 7),
-        )
-
-    def forward(self, x, start_values=None):
-        out = self.base(x)
-        logits_8 = self.binary(out)
-        if start_values is None:
-            regr_7 = torch.sigmoid(
-                self.resgresion(torch.cat((out, torch.zeros(x.size()[0], 24, device=x.device)), axis=1))
-            )
-        else:
-            regr_7 = torch.sigmoid(self.resgresion(torch.cat((out, start_values), axis=1)))
-        return logits_8, regr_7
-
-# Ranges for denormalization of regression outputs
-RANGES = [
-    (-0.5, 5.5),   # Влияние ствола скважины_details
-    (-0.3, 4.1),   # Радиальный режим_details
-    (-0.7, 2.2),   # Линейный режим_details
-    (-0.4, 4.0),   # Билинейный режим_details
-    (-0.3, 3.0),   # Сферический режим_details
-    (2.4, 495.0),  # Граница постоянного давления_details
-    (4.0, 555.0),  # Граница непроницаемый разлом_details
-]
-
-def denormalize_labels(pred_labels):
-    pred_labels_orig = pred_labels.clone()
-    for i in range(7):
-        min_val, max_val = RANGES[i]
-        pred_labels_orig[:, i] = pred_labels[:, i] * (max_val - min_val) + min_val
-    return pred_labels_orig
-
-# Create intermediate images from time series data
-def create_and_save_graphics(time, pressure, devpressure, img_size=(256, 256, 3)):
-    background = np.ones(img_size, dtype=np.uint8) * 255
-    scatter_img = background.copy()
-    plot_img = background.copy()
+def preprocess_segment(df, grid_timestep=0.01, smoothing_time_window=5, interp_method='time'):
+    seg = df.copy()
+    seg.set_index('Time', inplace=True)
+    stt, endt = np.floor(seg.index.min()), np.ceil(seg.index.max())
+    uniform_times = np.arange(stt, endt + 1, grid_timestep)
     
-    if len(time) == 0:
-        return plot_img, scatter_img
+    seg.index = pd.to_timedelta(seg.index, unit='h')
+    new_times = pd.to_timedelta(uniform_times, unit='h')
+    union_idx = seg.index.union(new_times)
+    
+    # Interpolate and fill remaining NaNs
+    seg_interp = seg.reindex(union_idx).interpolate(interp_method).ffill().bfill()
+    
+    index_window_size = int(float(smoothing_time_window) / float(grid_timestep))
+    index_window_size = int(index_window_size)  # Ensure it's integer
+    
+    seg_uniform = seg_interp.reindex(new_times)
+    
+    # Apply rolling mean
+    seg_uniform = seg_uniform.rolling(window=index_window_size, center=True, min_periods=1).mean()
+    
+    # Fill edges
+    seg_uniform = seg_uniform.ffill().bfill()
+    
+    seg_uniform.index = seg_uniform.index.total_seconds() / 3600
+    seg_uniform.reset_index(inplace=True)
+    seg_uniform.columns = ['Time', 'Pressure']
+    seg_uniform['Timestamp'] = pd.to_timedelta(seg_uniform['Time'], unit='h')
+    return seg_uniform
 
-    time_min = min(time)
-    time_max = max(time)
-    pressure_min = min(pressure)
-    pressure_max = max(pressure)
-    devpressure_min = min(devpressure)
-    devpressure_max = max(devpressure)
-
-    max_y = max(devpressure_max, pressure_max)
-    min_y = min(devpressure_min, pressure_min)
-
-    grid_x = np.array([x / 2 for x in range(int(2 * time_min), int(2 * time_max) + 1)])
-    grid_y = np.array([x / 2 for x in range(int(2 * min_y), int(2 * max_y) + 1)])
-
-    if time_max - time_min == 0:
-        norm_time = np.zeros(len(time), dtype=np.int32)
-        grid_x_norm = np.zeros_like(grid_x, dtype=np.int32)
+def get_recovery_intervals(df_bhp, p=1, int_len_treshhold=70):
+    df = df_bhp.copy()
+    df['Pressure'] = -df['Pressure'].values + np.max(df['Pressure'].values)
+    _, _, _, shutin_transient_interval = TPMR(df, p, int_len_treshhold)
+    
+    if shutin_transient_interval.empty:
+        shutin_transient_interval = pd.DataFrame(columns=['start', 'end'])
     else:
-        norm_time = ((np.array(time) - time_min) / (time_max - time_min) * (img_size[1] - 10)).astype(np.int32)
-        grid_x_norm = ((grid_x - time_min) / (time_max - time_min) * (img_size[1] - 10)).astype(np.int32)
+        shutin_transient_interval = shutin_transient_interval[['start/hr', 'end/hr']]
+        shutin_transient_interval.columns = ['start', 'end']
+    return shutin_transient_interval
 
-    if max_y - min_y == 0:
-        norm_pressure = np.zeros(len(pressure), dtype=np.int32)
-        norm_devpressure = np.zeros(len(devpressure), dtype=np.int32)
-        grid_y_norm = np.zeros_like(grid_y, dtype=np.int32)
+def get_drop_intervals(df_bhp, p=1, int_len_treshhold=70):
+    _, _, _, shutin_transient_interval = TPMR(df_bhp, p, int_len_treshhold)
+    if shutin_transient_interval.empty:
+        shutin_transient_interval = pd.DataFrame(columns=['start', 'end'])
     else:
-        norm_pressure = ((np.array(pressure) - min_y) / (max_y - min_y) * (img_size[0] - 10)).astype(np.int32)
-        norm_pressure = img_size[0] - norm_pressure
-        norm_devpressure = ((np.array(devpressure) - min_y) / (max_y - min_y) * (img_size[0] - 10)).astype(np.int32)
-        norm_devpressure = img_size[0] - norm_devpressure
-        grid_y_norm = ((grid_y - min_y) / (max_y - min_y) * (img_size[0] - 10)).astype(np.int32)
-        grid_y_norm = img_size[0] - grid_y_norm
+        shutin_transient_interval = shutin_transient_interval[['start/hr', 'end/hr']]
+        shutin_transient_interval.columns = ['start', 'end']
+    return shutin_transient_interval
 
-    for x in grid_x_norm:
-        cv2.line(scatter_img, (int(x), 0), (int(x), img_size[0]), color=(128, 128, 128), thickness=1)
-        cv2.line(plot_img, (int(x), 0), (int(x), img_size[0]), color=(128, 128, 128), thickness=1)
+def fit_ln_curve(df):
+    df = df[df['Time'] > 0].copy()
+    
+    def objective(epsilon_shift):
+        df['lnTime'] = np.log(df['Time'] + epsilon_shift)
+        
+        X = np.vstack([df['lnTime'], np.ones(len(df))]).T
+        y = df['Pressure'].values
+        
+        coeff, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+        q, b = coeff
+        
+        y_pred = q * df['lnTime'] + b
+        return mean_squared_error(y, y_pred)
+    
+    result = minimize_scalar(objective, bounds=(-min(df['Time']), 1), method='bounded')
+    best_epsilon_shift = result.x
+    
+    df['lnTime'] = np.log(df['Time'] + best_epsilon_shift)
+    X = np.vstack([df['lnTime'], np.ones(len(df))]).T
+    y = df['Pressure'].values
+    coeff, _, _, _ = np.linalg.lstsq(X, y, rcond=None)
+    q, b = coeff
+    y_pred = q * df['lnTime'] + b
+    
+    mse = mean_squared_error(y, y_pred)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(y, y_pred)
+    r2 = r2_score(y, y_pred)
+    
+    return {
+        'q': q, 'b': b,
+        'MSE': mse, 'RMSE': rmse,
+        'MAE': mae, 'R2': r2,
+        'Epsilon Shift': best_epsilon_shift
+    }
 
-    for y in grid_y_norm:
-        cv2.line(scatter_img, (0, int(y)), (img_size[1], int(y)), color=(128, 128, 128), thickness=1)
-        cv2.line(plot_img, (0, int(y)), (img_size[1], int(y)), color=(128, 128, 128), thickness=1)
+def compute_tsfresh_features(df):
+    df['id'] = 1
+    features_df = extract_features(
+        df, 
+        column_id='id',
+        column_sort='Time',
+        column_value='Pressure',
+        default_fc_parameters=MinimalFCParameters(),
+        n_jobs=1
+    )
+    return features_df.iloc[0].to_dict()
 
-    for i in range(len(time)):
-        cv2.circle(scatter_img, (int(norm_time[i]), int(norm_pressure[i])), 1, (255, 0, 0), -1)
-        cv2.circle(scatter_img, (int(norm_time[i]), int(norm_devpressure[i])), 1, (0, 0, 255), -1)
+def build_test_for_single_file(file_path, model):
+    
+    series = load_series(file_path)
+    segments = split_series_by_gap(series, 50)
+    
+    interval_records = []
+    for seg in segments:
+        if len(seg) < 20:
+            continue
+        
+        proc_seg = preprocess_segment(seg, smoothing_time_window=7)
+        recovery_ints_pred = get_recovery_intervals(proc_seg)
+        drop_ints_pred = get_drop_intervals(proc_seg)
+        
+        recovery_ints_pred['type'] = 'recovery'
+        drop_ints_pred['type'] = 'drop'
+        
+        all_ints = pd.concat([recovery_ints_pred, drop_ints_pred])
+        
+        for _, interval in all_ints.iterrows():
+            segment_df = series[(series['Time'] >= interval['start']) & (series['Time'] <= interval['end'])]
+            if len(segment_df) < 20:
+                continue
+            
+            seg_ = segment_df.copy()
+            seg_['Time'] = seg_['Time'].values - np.min(seg_['Time'].values)
+            ln_curve = fit_ln_curve(seg_)
+            
+            ln_curve['interval_start'] = interval['start']
+            ln_curve['interval_end'] = interval['end']
+            ln_curve['type'] = interval['type']
+            ln_curve['duration'] = interval['end'] - interval['start']
+            ln_curve['len'] = len(seg_)
+            ln_curve['type_binary'] = 1 if interval['type'] == 'recovery' else 0
+            ln_curve['amplitude'] = seg_['Pressure'].max() - seg_['Pressure'].min()
+            
+            feats = compute_tsfresh_features(seg_)
+            ln_curve.update(feats)
+            
+            interval_records.append(ln_curve)
+    
+    if not interval_records:
+        return pd.DataFrame([])  
+    
+    df_test = pd.DataFrame(interval_records)
+    
+    drop_cols = ['interval_start','interval_end','type']
+    feats_df = df_test.drop(drop_cols, axis=1)
 
-    for i in range(len(time) - 1):
-        cv2.line(plot_img, (int(norm_time[i]), int(norm_pressure[i])),
-                 (int(norm_time[i + 1]), int(norm_pressure[i + 1])), color=(255, 0, 0), thickness=1)
-        cv2.line(plot_img, (int(norm_time[i]), int(norm_devpressure[i])),
-                 (int(norm_time[i + 1]), int(norm_devpressure[i + 1])), color=(0, 0, 255), thickness=1)
-
-    return plot_img, scatter_img
-
-def process_sample(curr_time_series):
-    time = np.array([triplet[0] for triplet in curr_time_series])
-    pressure = np.array([triplet[1] for triplet in curr_time_series])
-    derivative = np.array([triplet[2] for triplet in curr_time_series])
-    if len(time) > 1:
-        time = time - (min(time) - 1e-6)
-        time = np.log(time)
-        pressure = np.log(pressure)
-        devpressure = np.log(derivative)
-        time_interp = np.linspace(time.min(), time.max(), 10)
-        interp_pressure = interp1d(time, pressure, kind="linear", fill_value="extrapolate")
-        interp_devpressure = interp1d(time, devpressure, kind="linear", fill_value="extrapolate")
-        pressure_interp = interp_pressure(time_interp)
-        devpressure_interp = interp_devpressure(time_interp)
-        plot_img, scatter_img = create_and_save_graphics(time, pressure, devpressure)
-        np_labels = np.array(
-            [time[0], time[-1], pressure[0], devpressure[0]] +
-            list(pressure_interp) +
-            list(devpressure_interp)
-        )
-    else:
-        plot_img, scatter_img = create_and_save_graphics([], [], [])
-        np_labels = np.array([0, 0, 0, 0] + 20 * [0])
-    return plot_img, scatter_img, np_labels
-
-# Image transformation for model input
-transform = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.ToTensor()
-])
-
-# ----------------------- UI & Inference Integration -----------------------
-
-st.markdown(f"""
-<style>
-/* Title (h1) should be #30d5c8 */
-h1 {{
-    color: #30d5c8 !important;
-}}
-</style>
-""", unsafe_allow_html=True)
-
-
-st.title("PressureAI")
-st.markdown(
-    """
-    <div class="explanation">
-      Вставьте csv файл с тремя временными рядами в формате обучающих данных.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    df_test['class'] = model.predict(feats_df)
+    return df_test
 
 
-
-uploaded_file = st.file_uploader("Выберите csv файл")
-if uploaded_file is not None:
-    file_uuid = uploaded_file.name  # Use filename as UUID
-    try:
-        content = uploaded_file.read().decode("utf-8").splitlines()
-        curr_time_series = [tuple(map(float, line.strip().split("\t"))) for line in content if line.strip() != ""]
-        st.success(f"Файл загружен успешно. UUID: {file_uuid}. Строк: {len(curr_time_series)}")
-    except Exception as e:
-        st.error("Ошибка при чтении файла: " + str(e))
-        curr_time_series = None
-    if curr_time_series:
-        if st.button("Выполнить inference"):
+def main():
+    st.markdown(
+        """
+        <style>
+        /* Title (h1) should be #30d5c8 */
+        h1 {
+            color: #30d5c8 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+    
+    st.title("PressureAI")
+    st.markdown(
+        """
+        <div class="explanation">
+          Загрузите одиночный файл, состоящий из двух столбцов:
+          <br/>Time (ч) и Pressure (бар), разделённые табуляцией.
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    
+    @st.cache_resource
+    def load_rf_model():
+        model_path = r'./models/random_forest_model.pkl'
+        with open(model_path, 'rb') as file:
+            rf = pickle.load(file)
+        return rf
+    
+    rf_model = load_rf_model()
+    
+    uploaded_file = st.file_uploader("Выберите файл с временным рядом")
+    if uploaded_file is not None:
+        temp_file_path = "./_temp_inference_file.txt"
+        with open(temp_file_path, "wb") as f:
+            f.write(uploaded_file.getvalue())
+        
+        st.success("Файл загружен. Нажмите 'Выполнить обработку' для старта.")
+        
+        if st.button("Выполнить обработку"):
             with st.spinner("Обработка..."):
-                # Process sample to generate intermediate images and start values
-                plot_img, scatter_img, np_labels = process_sample(curr_time_series)
-                # Convert images from BGR to RGB for display
-                plot_img_rgb = cv2.cvtColor(plot_img, cv2.COLOR_BGR2RGB)
-                scatter_img_rgb = cv2.cvtColor(scatter_img, cv2.COLOR_BGR2RGB)
+                df_result = build_test_for_single_file(temp_file_path, rf_model)
                 
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    st.image(plot_img_rgb, caption="Plot Image (График)", width=250)
+                if df_result.empty:
+                    st.warning("Не удалось обнаружить пригодные интервалы в этом файле.")
+                else:
+                    
+                    intervals_df = df_result[df_result['class'] == 1][['interval_start','interval_end','type']]
+                    
+                    original_series = load_series(temp_file_path)
+                    
+                    fig, ax = plt.subplots()
+                    ax.plot(original_series['Time'], original_series['Pressure'], label='Pressure', lw=1)
+                    
+                    for _, row in intervals_df.iterrows():
+                        c = 'blue' if row['type'] == 'recovery' else 'red'
+                        ax.axvspan(row['interval_start'], row['interval_end'], color=c, alpha=0.2)
+                    
+                    ax.set_xlabel("Time (hr)")
+                    ax.set_ylabel("Pressure")
+                    ax.set_title("Выделенные интервалы (синие = recovery, красные = drop)")
+                    st.pyplot(fig)
+                    
 
-                with col2:
-                    st.image(scatter_img_rgb, caption="Scatter Image (Разброс точек)", width=250)
-                # Prepare model input
-                plot_tensor = transform(Image.fromarray(plot_img_rgb))
-                scatter_tensor = transform(Image.fromarray(scatter_img_rgb))
-                res_img = torch.cat([plot_tensor, scatter_tensor], dim=0).unsqueeze(0)
-                start_values = torch.tensor(np_labels).unsqueeze(0)
-                # Load model (cached)
-                @st.cache_resource
-                def load_model():
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    model = MultiTaskResNet()
-                    state_dict_path = os.path.join("resnet101_0.9528.pth")
-                    state_dict = torch.load(state_dict_path, map_location=device)
-                    model.load_state_dict(state_dict)
-                    model.to(device)
-                    model.eval()
-                    return model, device
-                model, device = load_model()
-                res_img = res_img.to(device).float()
-                start_values = start_values.to(device).float()
-                with torch.no_grad():
-                    logits_8, regr_7 = model(res_img, start_values)
-                    pred_binary = torch.sigmoid(logits_8).cpu().numpy().flatten()
-                    pred_regression = regr_7.cpu().numpy()
-                    pred_regression = denormalize_labels(torch.tensor(pred_regression)).cpu().numpy().flatten()
-                    pred_binary = (pred_binary >= 0.5).astype(int)
-                # Build full output for CSV download
-                output_data = {"file": file_uuid}
-                for name, val in zip(bin_columns, pred_binary):
-                    output_data[name] = val
-                for name, val in zip(num_columns, pred_regression):
-                    output_data[name] = val
-                df_full = pd.DataFrame([output_data])
-                csv_full = df_full.to_csv(index=False, header=True)
-                # Build display table: include only columns where corresponding binary equals 1.
-                display_dict = {}
-                for idx, feature in enumerate(num_columns):
-                    if pred_binary[idx+1] == 1:
-                        display_dict[feature] = [pred_regression[idx]]
-                if not display_dict:
-                    display_dict["Нет численных признаков"] = [""]
-                df_display = pd.DataFrame(display_dict)
-                st.write("**Результаты (численные значения для признаков, где бинарное = 1):**")
-                st.table(df_display)
-                st.download_button("Скачать CSV", csv_full, file_name="results.csv", mime="text/csv")
+                    intervals_df = intervals_df.sort_values(by='interval_start').reset_index(drop=True)
+                    csv_data = intervals_df.to_csv(index=False, sep=',')
+                    
+                    st.download_button(
+                        label="Скачать результат",
+                        data=csv_data,
+                        file_name="intervals_result.csv",
+                        mime="text/csv"
+                    )
+
+if __name__ == "__main__":
+    main()
