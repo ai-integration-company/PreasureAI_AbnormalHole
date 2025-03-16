@@ -221,7 +221,7 @@ def main():
         
         st.success("Файл загружен. Нажмите 'Выполнить обработку' для старта.")
         
-        if st.button("Выполнить обработку"):
+        if st.button("Рассчитать интервалы интереса"):
             with st.spinner("Обработка..."):
                 df_result = build_test_for_single_file(temp_file_path, rf_model)
                 

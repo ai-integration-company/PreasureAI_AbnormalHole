@@ -21,7 +21,10 @@ COPY . .
 
 
 # Expose the port used by Streamlit
-EXPOSE 8501
+EXPOSE 8502
+
+
+ENV STREAMLIT_SERVER_PORT=8502
 
 # Command to run Streamlit
-CMD ["streamlit", "run", "app.py"]
+CMD ["streamlit", "run", "app.py", "--server.port=8502", "--server.address=0.0.0.0"]
