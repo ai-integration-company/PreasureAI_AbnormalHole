@@ -9,7 +9,7 @@
 2. Выполните следующие команды:
 ```
 docker build -t pressure_ai_2 .
-docker run --rm -p 8501:8501 --gpus all pressure_ai_2
+docker run --rm -p 8502:8502 --gpus all pressure_ai_2
 ```
 3. Перейдите по Local URL: http://localhost:8501
 4. Дождитесь загрузки моделей и зависимостей.
